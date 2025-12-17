@@ -311,6 +311,28 @@ class LeadGenerationPipeline:
                     profile["company"] = company
                     profile["company_source"] = profile.get("company_source", "affiliation")
 
+        # If company/location are still unknown, attempt Serp-based researcher enrichment
+        # (This is critical when ORCID is sparse and PubMed returns 0 results.)
+        company_now = profile.get("company", "")
+        location_now = profile.get("location", "")
+        if (not company_now or company_now == "Unknown") or (not location_now or location_now == "Unknown"):
+            logger.info(
+                f"Attempting Serp researcher enrichment for '{profile.get('name', '')}': "
+                f"company='{company_now}' location='{location_now}'"
+            )
+            serp_info = self._search_researcher_via_serp(profile.get("name", ""))
+            if serp_info:
+                if (not company_now or company_now == "Unknown") and serp_info.get("company"):
+                    profile["company"] = serp_info["company"]
+                    profile["company_source"] = "serp_fallback"
+                if (not location_now or location_now == "Unknown") and serp_info.get("location"):
+                    profile["location"] = serp_info["location"]
+                if serp_info.get("affiliation") and not profile.get("affiliation"):
+                    profile["affiliation"] = serp_info["affiliation"]
+
+        # IMPORTANT: refresh local variables after any enrichment that mutates the profile
+        company = profile.get("company", "")
+
         # Research company first (used to discover official website/domain)
         if company and company != "Unknown":
             company_info = self.company_researcher.research_company(
@@ -327,6 +349,9 @@ class LeadGenerationPipeline:
             )
             profile["funding"] = funding_info
         else:
+            logger.info(
+                f"Skipping company research (company is unknown) for '{profile.get('name', '')}'"
+            )
             profile["company_research"] = {}
             profile["funding"] = {}
             profile["company_domain"] = ""
@@ -364,7 +389,9 @@ class LeadGenerationPipeline:
             Dictionary with company, location, affiliation if found
         """
         try:
-            if not self.config.get("serp_api_key"):
+            serp_key = (self.config.get("serp_api_key") or "").strip()
+            if not serp_key:
+                logger.info("SerpAPI not configured; skipping Serp fallback enrichment")
                 return {}
             
             try:
@@ -377,7 +404,7 @@ class LeadGenerationPipeline:
             query = f'"{researcher_name}" researcher'
             params = {
                 "q": query,
-                "api_key": self.config.get("serp_api_key"),
+                "api_key": serp_key,
                 "engine": "google",
                 "num": 5
             }
@@ -387,32 +414,53 @@ class LeadGenerationPipeline:
             organic_results = results.get("organic_results", [])
             
             if not organic_results:
+                logger.info(f"Serp fallback: no results for researcher: {researcher_name}")
                 return {}
             
             # Extract company and location from first result snippet
             first_result = organic_results[0]
-            snippet = first_result.get("snippet", "").lower()
-            title = first_result.get("title", "").lower()
-            combined_text = f"{title} {snippet}"
+            snippet_raw = (first_result.get("snippet", "") or "").strip()
+            title_raw = (first_result.get("title", "") or "").strip()
+            combined_text_raw = f"{title_raw} {snippet_raw}".strip()
             
             company = ""
             location = ""
-            affiliation = first_result.get("snippet", "")
+            affiliation = snippet_raw
             
-            # Try to extract company name from snippet
-            # Look for patterns like "at Company", "Company researcher", etc.
             import re
-            at_pattern = r'at\s+([A-Z][A-Za-z\s&]+?)(?:\s+in\s+|,|\.|$)'
-            at_match = re.search(at_pattern, affiliation)
-            if at_match:
-                company = at_match.group(1).strip()
+
+            # Heuristic 1: title often looks like "Name - Company" or "Name | Company"
+            if title_raw:
+                for sep in [" - ", " | ", " — "]:
+                    if sep in title_raw:
+                        tail = title_raw.split(sep, 1)[1].strip()
+                        if tail and len(tail) <= 80:
+                            company = tail
+                        break
+
+            # Heuristic 2: snippet patterns like "... at Company ..." (case-insensitive)
+            if not company and affiliation:
+                at_match = re.search(r"\bat\s+([^.,;\n]{2,80})", affiliation, flags=re.IGNORECASE)
+                if at_match:
+                    candidate = at_match.group(1).strip()
+                    # Trim trailing "in <location>"
+                    candidate = re.sub(r"\s+in\s+.*$", "", candidate, flags=re.IGNORECASE).strip()
+                    if candidate:
+                        company = candidate
             
-            # Try to extract location from snippet
-            # Look for city, state patterns
-            location_pattern = r'(?:in|based in|located in)\s+([A-Z][A-Za-z\s,]+?)(?:\.|,|$)'
-            loc_match = re.search(location_pattern, affiliation)
-            if loc_match:
-                location = loc_match.group(1).strip()
+            # Location extraction: "based in X", "located in X", or "in X" (case-insensitive)
+            if affiliation:
+                loc_match = re.search(
+                    r"\b(?:based in|located in|in)\s+([^.;\n]{2,60})",
+                    affiliation,
+                    flags=re.IGNORECASE
+                )
+                if loc_match:
+                    location = loc_match.group(1).strip().strip(",")
+
+            logger.info(
+                f"Serp fallback for '{researcher_name}': company='{company}' location='{location}'"
+            )
             
             import time
             time.sleep(1.0)
@@ -421,11 +469,13 @@ class LeadGenerationPipeline:
                 "company": company,
                 "location": location,
                 "affiliation": affiliation,
-                "source": "serp_researcher_search"
+                "source": "serp_researcher_search",
+                "serp_title": title_raw,
+                "serp_link": first_result.get("link", "")
             }
         
         except Exception as e:
-            logger.debug(f"SerpAPI researcher search failed for {researcher_name}: {str(e)}")
+            logger.warning(f"SerpAPI researcher search failed for {researcher_name}: {str(e)}")
             return {}
 
     def _extract_company_from_affiliation(self, affiliation: str) -> str:
