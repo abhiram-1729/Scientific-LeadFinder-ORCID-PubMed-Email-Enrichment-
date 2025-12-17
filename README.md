@@ -2,6 +2,10 @@
 
 Lead discovery and enrichment pipeline for identifying and scoring researchers and decision-makers in the **3D in‑vitro models** and **drug safety / toxicology** space.
 
+## Live Demo
+
+https://88uqgjjhbdcbbcfz3nykmw.streamlit.app/
+
 This repository focuses on **real-data enrichment** (no fabricated lead details). When an attribute cannot be reliably sourced (e.g., business email without a verified domain), it is left empty rather than guessed.
 
 ---
